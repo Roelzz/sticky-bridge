@@ -1,8 +1,10 @@
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
 import main
-from ha_client import HAError, normalize_events
+from ha_client import HAClient, HAError, _to_calendar_event, normalize_events
 
 TEST_TOKEN = "test-token-abc"
 
@@ -87,3 +89,32 @@ def test_normalize_truncates_title_and_defaults_summary():
     result = normalize_events(events, max_events=6, title_max_len=40)
     assert result[0]["title"] == "(titelloos)"
     assert len(result[1]["title"]) == 40
+
+
+def test_to_calendar_event_converts_service_payloads():
+    timed = _to_calendar_event(
+        {"summary": "Lunch", "start": "2026-09-02T12:00:00+02:00"}
+    )
+    allday = _to_calendar_event({"summary": "Holiday", "start": "2026-09-02"})
+    native = _to_calendar_event(
+        {"summary": "Legacy", "start": {"dateTime": "2026-09-02T09:00:00+02:00"}}
+    )
+    assert timed["start"] == {"dateTime": "2026-09-02T12:00:00+02:00"}
+    assert allday["start"] == {"date": "2026-09-02"}
+    assert native["start"] == {"dateTime": "2026-09-02T09:00:00+02:00"}
+
+
+def test_fetch_debug_reports_per_entity(monkeypatch):
+    client = HAClient("http://ha.test", "tok", "Europe/Amsterdam")
+
+    def fake_get_events(self, entity, start_iso, end_iso):
+        if entity == "calendar.broken":
+            raise HAError("HTTP 404")
+        return [{"summary": "X", "start": {"date": "2026-09-02"}}]
+
+    monkeypatch.setattr(HAClient, "_get_events", fake_get_events)
+    day, rows = asyncio.run(client.fetch_debug(["calendar.ok", "calendar.broken"]))
+    assert day
+    assert rows[0] == {"entity": "calendar.ok", "ok": True, "count": 1, "error": None}
+    assert rows[1]["ok"] is False
+    assert "404" in rows[1]["error"]

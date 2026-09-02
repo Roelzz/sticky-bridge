@@ -98,6 +98,29 @@ async def agenda_today(date: str | None = Query(default=None)) -> dict:
     return {"date": day_str, "events": events}
 
 
+@app.get("/api/agenda/debug", dependencies=[Depends(require_token)])
+async def agenda_debug(date: str | None = Query(default=None)) -> dict:
+    if not settings.ha_token:
+        raise HTTPException(status_code=503, detail="HA_TOKEN not configured")
+    entities = [
+        e.strip()
+        for e in settings.agenda_calendar_entities.split(",")
+        if e.strip()
+    ]
+    for probe in ("calendar.calendar",):
+        if probe not in entities:
+            entities.append(probe)
+    day = None
+    if date:
+        try:
+            day = date_cls.fromisoformat(date)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
+    client = HAClient(settings.ha_url, settings.ha_token, settings.ha_timezone)
+    day_str, rows = await client.fetch_debug(entities, day)
+    return {"date": day_str, "calendars": rows}
+
+
 _weather_client = WeatherClient(
     settings.open_meteo_base_url,
     settings.weather_latitude,
