@@ -1,0 +1,9 @@
+services:
+  sticky-bridge:
+    build: .
+    container_name: sticky-bridge
+    ports:
+      - "8070:8070"
+    env_file:
+      - .env
+    restart: unless-stopped
