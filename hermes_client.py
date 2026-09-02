@@ -4,6 +4,12 @@ import urllib.request
 
 from loguru import logger
 
+_INSTRUCTION = (
+    "Beantwoord in maximaal 120 karakters, in het Nederlands, "
+    "zonder opmaak."
+)
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "stopped"}
+
 
 class HermesError(RuntimeError):
     pass
@@ -11,50 +17,71 @@ class HermesError(RuntimeError):
 
 class HermesClient:
     def __init__(self, base_url: str, api_key: str, model: str,
-                 timeout: float = 75.0) -> None:
+                 overall_timeout: float = 150.0,
+                 poll_interval: float = 3.0,
+                 request_timeout: float = 20.0) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
-        self._timeout = timeout
+        self._overall_timeout = overall_timeout
+        self._poll_interval = poll_interval
+        self._request_timeout = request_timeout
 
-    def _post(self, payload: dict) -> dict:
+    def _request(self, method: str, path: str,
+                 payload: dict | None = None) -> dict:
+        data = json.dumps(payload).encode() if payload is not None else None
         request = urllib.request.Request(
-            f"{self._base_url}/v1/chat/completions",
-            data=json.dumps(payload).encode(),
+            f"{self._base_url}{path}",
+            data=data,
+            method=method,
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+        with urllib.request.urlopen(request,
+                                    timeout=self._request_timeout) as resp:
             return json.loads(resp.read())
 
-    async def ask(self, question: str, max_answer_chars: int) -> str:
-        payload = {
+    def _submit_run(self, question: str) -> str:
+        result = self._request("POST", "/v1/runs", {
             "model": self._model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Je bent een korte-hulpassistent voor een "
-                        "e-ink-scherm van het formaat een creditcard. "
-                        "Antwoord in maximaal 120 karakters, in het "
-                        "Nederlands, zonder opmaak."
-                    ),
-                },
-                {"role": "user", "content": question},
-            ],
-            "max_tokens": 160,
-            "temperature": 0.3,
-        }
+            "input": f"{question}\n\n{_INSTRUCTION}",
+        })
+        run_id = result.get("run_id", "")
+        if not run_id:
+            raise HermesError("hermes returned no run_id")
+        return run_id
+
+    def _run_status(self, run_id: str) -> dict:
+        return self._request("GET", f"/v1/runs/{run_id}")
+
+    async def ask(self, question: str, max_answer_chars: int) -> str:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._overall_timeout
         try:
-            result = await asyncio.to_thread(self._post, payload)
+            run_id = await asyncio.to_thread(self._submit_run, question)
         except (OSError, ValueError) as exc:
-            logger.error(f"hermes request failed: {exc}")
+            logger.error(f"hermes run submission failed: {exc}")
             raise HermesError(str(exc)) from exc
-        choices = result.get("choices") or []
-        content = (choices[0].get("message") or {}).get("content", "") \
-            if choices else ""
-        if not content:
-            raise HermesError("empty completion")
-        return " ".join(content.split())[:max_answer_chars]
+        logger.info(f"hermes run submitted: {run_id}")
+        status: dict = {}
+        while True:
+            try:
+                status = await asyncio.to_thread(self._run_status, run_id)
+            except (OSError, ValueError) as exc:
+                logger.error(f"hermes run poll failed: {exc}")
+                raise HermesError(str(exc)) from exc
+            if status.get("status") in _TERMINAL_STATUSES:
+                break
+            if loop.time() >= deadline:
+                raise HermesError(f"hermes run {run_id} timed out")
+            await asyncio.sleep(self._poll_interval)
+        if status.get("status") != "completed":
+            raise HermesError(
+                f"hermes run {run_id} ended as {status.get('status')}"
+            )
+        output = " ".join(str(status.get("output", "")).split())
+        if not output:
+            raise HermesError("empty run output")
+        return output[:max_answer_chars]
