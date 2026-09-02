@@ -28,9 +28,7 @@ class Settings(BaseSettings):
     ha_url: str = "http://192.168.68.105:8123"
     ha_token: str = ""
     ha_timezone: str = "Europe/Amsterdam"
-    agenda_calendar_entities: str = (
-        "calendar.gezin,calendar.roelschenk_gmail_com,calendar.birthdays"
-    )
+    agenda_calendar_entities: str = "calendar.calendar"
     agenda_max_events: int = 6
     agenda_title_max_len: int = 40
     open_meteo_base_url: str = "https://api.open-meteo.com"

@@ -37,11 +37,7 @@ def test_agenda_fails_closed_without_ha_token(token_secret):
 
 def test_agenda_returns_events(token_secret, ha_configured, monkeypatch):
     async def fake_fetch_today(self, entities, max_events, title_max_len, day=None):
-        assert entities == [
-            "calendar.gezin",
-            "calendar.roelschenk_gmail_com",
-            "calendar.birthdays",
-        ]
+        assert entities == ["calendar.calendar"]
         return "2026-09-01", [{"t": "09:30", "title": "Standup"}]
 
     monkeypatch.setattr(main.HAClient, "fetch_today", fake_fetch_today)
