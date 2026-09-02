@@ -19,13 +19,15 @@ class HermesClient:
     def __init__(self, base_url: str, api_key: str, model: str,
                  overall_timeout: float = 150.0,
                  poll_interval: float = 3.0,
-                 request_timeout: float = 20.0) -> None:
+                 request_timeout: float = 20.0,
+                 stream_read_timeout: float = 120.0) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
         self._overall_timeout = overall_timeout
         self._poll_interval = poll_interval
         self._request_timeout = request_timeout
+        self._stream_read_timeout = stream_read_timeout
 
     def _request(self, method: str, path: str,
                  payload: dict | None = None) -> dict:
@@ -55,6 +57,60 @@ class HermesClient:
 
     def _run_status(self, run_id: str) -> dict:
         return self._request("GET", f"/v1/runs/{run_id}")
+
+    def _open_stream(self, question: str):
+        request = urllib.request.Request(
+            f"{self._base_url}/v1/chat/completions",
+            data=json.dumps({
+                "model": self._model,
+                "stream": True,
+                "messages": [{
+                    "role": "user",
+                    "content": f"{question}\n\n{_INSTRUCTION}",
+                }],
+            }).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            return urllib.request.urlopen(
+                request, timeout=self._stream_read_timeout)
+        except OSError as exc:
+            logger.error(f"hermes stream request failed: {exc}")
+            raise HermesError(str(exc)) from exc
+
+    def stream_ask(self, question: str,
+                   max_answer_chars: int):
+        response = self._open_stream(question)
+        total = 0
+        with response:
+            for raw in response:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except ValueError:
+                    logger.warning(f"unparsable sse event: {data[:80]}")
+                    continue
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                content = (choices[0].get("delta") or {}).get("content")
+                if not content:
+                    continue
+                remaining = max_answer_chars - total
+                if remaining <= 0:
+                    break
+                piece = content[:remaining]
+                total += len(piece)
+                yield piece
 
     async def ask(self, question: str, max_answer_chars: int) -> str:
         loop = asyncio.get_running_loop()

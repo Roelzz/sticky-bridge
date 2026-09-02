@@ -1,7 +1,14 @@
+import asyncio
 import os
 from datetime import date as date_cls
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from loguru import logger
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
@@ -145,14 +152,65 @@ _hermes_client = HermesClient(
 )
 
 
+def _next_or_none(stream):
+    try:
+        return next(stream)
+    except StopIteration:
+        return None
+
+
+async def _stream_pieces(stream):
+    sentinel = object()
+
+    def _next():
+        try:
+            return next(stream)
+        except StopIteration:
+            return sentinel
+
+    while True:
+        try:
+            piece = await asyncio.to_thread(_next)
+        except HermesError as exc:
+            logger.error(f"hermes stream aborted mid-answer: {exc}")
+            return
+        except OSError as exc:
+            logger.error(f"hermes stream read failed mid-answer: {exc}")
+            return
+        if piece is sentinel:
+            return
+        yield piece
+
+
 @app.post("/api/chat", dependencies=[Depends(require_token)])
-async def chat(request: ChatRequest) -> dict:
+async def chat(request: Request, body: ChatRequest) -> Response:
     if not settings.hermes_api_key:
         raise HTTPException(status_code=503, detail="HERMES_API_KEY not set")
+    wants_stream = "text/plain" in request.headers.get("accept", "")
+    if wants_stream:
+        stream = _hermes_client.stream_ask(
+            body.question, settings.chat_max_answer_chars
+        )
+        try:
+            first = await asyncio.to_thread(_next_or_none, stream)
+        except HermesError:
+            first = None
+        if first is not None:
+            return StreamingResponse(
+                _piece_stream(first, stream), media_type="text/plain"
+            )
     try:
         answer = await _hermes_client.ask(
-            request.question, settings.chat_max_answer_chars
+            body.question, settings.chat_max_answer_chars
         )
     except HermesError:
         raise HTTPException(status_code=502, detail="Hermes unavailable")
-    return {"answer": answer}
+    if wants_stream:
+        return PlainTextResponse(answer)
+    return JSONResponse({"answer": answer})
+
+
+async def _piece_stream(first: str, rest):
+    yield first
+    async for piece in _stream_pieces(rest):
+        yield piece
