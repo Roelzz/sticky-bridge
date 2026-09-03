@@ -140,3 +140,24 @@ def test_chat_stream_without_accept_still_json(token_secret, hermes_key,
         headers={"X-Bridge-Token": TEST_TOKEN},
     )
     assert response.json() == {"answer": "json antwoord"}
+
+
+def test_stream_with_keepalive_emits_on_silence():
+    import time
+
+    def slow_stream():
+        time.sleep(0.05)
+        yield "A"
+
+    async def collect():
+        pieces = []
+        async for piece in main._stream_with_keepalive(slow_stream(),
+                                                       interval=0.01):
+            pieces.append(piece)
+        return pieces
+
+    import asyncio
+
+    pieces = asyncio.run(collect())
+    assert pieces[-1] == "A"
+    assert "\r" in pieces

@@ -3,12 +3,7 @@ import os
 from datetime import date as date_cls
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import (
-    JSONResponse,
-    PlainTextResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
@@ -152,14 +147,11 @@ _hermes_client = HermesClient(
 )
 
 
-def _next_or_none(stream):
-    try:
-        return next(stream)
-    except StopIteration:
-        return None
+_KEEPALIVE_INTERVAL_S = 15.0
 
 
-async def _stream_pieces(stream):
+async def _stream_with_keepalive(stream, interval: float = _KEEPALIVE_INTERVAL_S):
+    loop = asyncio.get_running_loop()
     sentinel = object()
 
     def _next():
@@ -168,49 +160,54 @@ async def _stream_pieces(stream):
         except StopIteration:
             return sentinel
 
+    future = None
     while True:
+        if future is None:
+            future = loop.run_in_executor(None, _next)
         try:
-            piece = await asyncio.to_thread(_next)
+            item = await asyncio.wait_for(asyncio.shield(future), interval)
+        except TimeoutError:
+            yield "\r"
+            continue
+        future = None
+        if item is sentinel:
+            return
+        yield item
+
+
+async def _chat_text_stream(question: str):
+    emitted = False
+    try:
+        stream = _hermes_client.stream_ask(
+            question, settings.chat_max_answer_chars
+        )
+        async for piece in _stream_with_keepalive(stream):
+            emitted = True
+            yield piece
+        return
+    except (HermesError, OSError) as exc:
+        logger.error(f"hermes chat stream failed: {exc}")
+    if not emitted:
+        try:
+            answer = await _hermes_client.ask(question,
+                                              settings.chat_max_answer_chars)
+            yield answer
         except HermesError as exc:
-            logger.error(f"hermes stream aborted mid-answer: {exc}")
-            return
-        except OSError as exc:
-            logger.error(f"hermes stream read failed mid-answer: {exc}")
-            return
-        if piece is sentinel:
-            return
-        yield piece
+            logger.error(f"hermes runs-api fallback failed too: {exc}")
 
 
 @app.post("/api/chat", dependencies=[Depends(require_token)])
 async def chat(request: Request, body: ChatRequest) -> Response:
     if not settings.hermes_api_key:
         raise HTTPException(status_code=503, detail="HERMES_API_KEY not set")
-    wants_stream = "text/plain" in request.headers.get("accept", "")
-    if wants_stream:
-        stream = _hermes_client.stream_ask(
-            body.question, settings.chat_max_answer_chars
+    if "text/plain" in request.headers.get("accept", ""):
+        return StreamingResponse(
+            _chat_text_stream(body.question), media_type="text/plain"
         )
-        try:
-            first = await asyncio.to_thread(_next_or_none, stream)
-        except HermesError:
-            first = None
-        if first is not None:
-            return StreamingResponse(
-                _piece_stream(first, stream), media_type="text/plain"
-            )
     try:
         answer = await _hermes_client.ask(
             body.question, settings.chat_max_answer_chars
         )
     except HermesError:
         raise HTTPException(status_code=502, detail="Hermes unavailable")
-    if wants_stream:
-        return PlainTextResponse(answer)
     return JSONResponse({"answer": answer})
-
-
-async def _piece_stream(first: str, rest):
-    yield first
-    async for piece in _stream_pieces(rest):
-        yield piece
